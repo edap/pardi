@@ -1,6 +1,13 @@
+# Pardi
+
+A command line tool to parse DICOM files.
+
 ## Build
 
 To build the cli tool, move into the pardi folder and run `cargo build --release`. This command generates an optimized build in the `target/release` folder
+
+To build the tool with [rayon](https://docs.rs/rayon/latest/rayon/) enabled, run `cargo build --release --features rayon`
+
 
 ## Usage
 
@@ -25,7 +32,3 @@ Example: `./target/release/pardi --path data --debug`
 Example: `./target/release/pardi --path data --format json --output catalog.json`
 
 
-
-## Note
-
-This file has been testes only on Linux environment, as I do not have access at the moment to a windows or macOS machine.
