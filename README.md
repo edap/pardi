@@ -1,6 +1,6 @@
 # Pardi
 
-A command line tool to parse DICOM files.
+A command line tool to parse DICOM files. It extracts Patient ID, Patient Name and file name. 
 
 ## Build
 
