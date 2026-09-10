@@ -6,15 +6,15 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use parser::parse;
 use parser::Patient;
-use presenter::{as_csv, as_json};
-use printer::{print_catalog, print_error_messages};
+use presenter::StreamWriter;
+use printer::print_error_messages;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
-#[derive(clap::ValueEnum, Clone, Default, Debug, Serialize)]
+#[derive(clap::ValueEnum, Clone, Copy, Default, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     #[default]
@@ -49,36 +49,39 @@ fn main() -> Result<()> {
     let args = Args::parse();
     path_exists(&args.path)?;
 
+    let writer = StreamWriter::new(args.format, args.output.as_deref())?;
+
     #[cfg(feature = "rayon")]
-    let patients: Vec<Patient> = WalkDir::new(&args.path)
+    WalkDir::new(&args.path)
         .into_iter()
         .par_bridge()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            seek_patient(&entry, args.debug)
-        })
-        .collect::<Result<Vec<Patient>>>()?;
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| seek_patient(&entry, args.debug))
+        .for_each(|patient| {
+            if let Err(err) = writer.write_patient(&patient) {
+                eprintln!("Error writing patient {}: {}", patient, err);
+            }
+        });
 
     #[cfg(not(feature = "rayon"))]
-    let patients: Vec<Patient> = WalkDir::new(&args.path)
+    WalkDir::new(&args.path)
         .into_iter()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            seek_patient(&entry, args.debug)
-        })
-        .collect::<Result<Vec<Patient>>>()?;
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| seek_patient(&entry, args.debug))
+        .for_each(|patient| {
+            if let Err(err) = writer.write_patient(&patient) {
+                eprintln!("Error writing patient {}: {}", patient, err);
+            }
+        });
 
-    match args.format {
-        OutputFormat::Json => print_catalog(as_json(&patients), &args.output)?,
-        OutputFormat::Csv => print_catalog(as_csv(&patients), &args.output)?,
-    }
+    writer.finish()?;
 
     Ok(())
 }
 
-fn seek_patient(entry: &DirEntry, debug: bool) -> Option<Result<Patient>> {
+fn seek_patient(entry: &DirEntry, debug: bool) -> Option<Patient> {
     match parse(entry) {
-        Ok(patient) => Some(Ok(patient)),
+        Ok(patient) => Some(patient),
         Err(err) => {
             print_error_messages(err, debug);
             None
