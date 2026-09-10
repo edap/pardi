@@ -1,6 +1,6 @@
 # Pardi
 
-A command line tool to parse DICOM files. It extracts Patient ID, Patient Name and file name. 
+A command line tool to catalog DICOM files. For every file it finds, it extracts a configurable set of DICOM fields (by default Patient ID and Patient Name) plus the file path.
 
 ## Build
 
@@ -30,6 +30,12 @@ Example: `./target/release/pardi --path data --debug`
 - `--output` = Save the catalog to a file. If no output option is speficied, it prints the catalogue on screen.
 
 Example: `./target/release/pardi --path data --format json --output catalog.json`
+
+- `--tag` = A DICOM field to extract, given by its standard dictionary alias (e.g. `PatientID`, `PatientName`, `StudyDate`, `Modality`, `SeriesInstanceUID`...). Repeatable. If omitted, defaults to `PatientID` and `PatientName`. The requested field names become the CSV column headers / JSON object keys, in the order given.
+
+Example, extracting patient ID together with the modality and study date of each file: `./target/release/pardi --path data --format csv --tag PatientID --tag Modality --tag StudyDate`
+
+Any alias known to the DICOM standard data dictionary works; see the [`dicom-dictionary-std`](https://docs.rs/dicom-dictionary-std) documentation for the full list, or inspect a sample file with a DICOM dump tool to see which attributes it carries. If a requested field is missing from a given file, that file is skipped and reported as an error (visible with `--debug`).
 
 ## Benchmarks
 

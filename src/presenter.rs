@@ -1,4 +1,7 @@
-use crate::parser::Patient;
+//! Streams parsed [`Record`]s to an output sink as CSV or JSON, one record
+//! at a time.
+
+use crate::parser::Record;
 use crate::OutputFormat;
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -7,8 +10,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-/// Writes patients to the output one at a time, instead of buffering them
-/// all in memory before printing.
+/// Writes records to the output one at a time. Safe to call
+/// [`write_record`](StreamWriter::write_record) from multiple threads
+/// concurrently (e.g. from a rayon parallel iterator).
 pub struct StreamWriter {
     format: OutputFormat,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -16,7 +20,9 @@ pub struct StreamWriter {
 }
 
 impl StreamWriter {
-    pub fn new(format: OutputFormat, output: Option<&Path>) -> Result<Self> {
+    /// Opens `output` (or stdout, if `None`) and writes the format-specific
+    /// preamble (a CSV header built from `field_names`, or a JSON `[`).
+    pub fn new(format: OutputFormat, output: Option<&Path>, field_names: &[String]) -> Result<Self> {
         let writer: Box<dyn Write + Send> = match output {
             Some(path) => Box::new(
                 File::create(path)
@@ -24,15 +30,19 @@ impl StreamWriter {
             ),
             None => Box::new(io::stdout()),
         };
-        Self::with_writer(format, writer)
+        Self::with_writer(format, writer, field_names)
     }
 
     /// Builds a writer over an arbitrary sink (used for benchmarks/tests
     /// that don't want to write to stdout or a real file).
-    pub fn with_writer(format: OutputFormat, mut writer: Box<dyn Write + Send>) -> Result<Self> {
+    pub fn with_writer(
+        format: OutputFormat,
+        mut writer: Box<dyn Write + Send>,
+        field_names: &[String],
+    ) -> Result<Self> {
         match format {
             OutputFormat::Json => write!(writer, "[")?,
-            OutputFormat::Csv => writeln!(writer, "Patient ID,Patient Name,File")?,
+            OutputFormat::Csv => writeln!(writer, "{},File", field_names.join(","))?,
         }
         Ok(Self {
             format,
@@ -41,17 +51,18 @@ impl StreamWriter {
         })
     }
 
-    pub fn write_patient(&self, patient: &Patient) -> Result<()> {
+    /// Writes one record. For CSV, values are written in the same order as
+    /// the `field_names` given to [`new`](StreamWriter::new)/
+    /// [`with_writer`](StreamWriter::with_writer) — every record must have
+    /// been parsed with that same field list.
+    pub fn write_record(&self, record: &Record) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
         match self.format {
             OutputFormat::Csv => {
-                writeln!(
-                    writer,
-                    "{},{},{}",
-                    patient.patient_id,
-                    patient.patient_name,
-                    patient.file.display()
-                )?;
+                for (_, value) in &record.fields {
+                    write!(writer, "{},", value)?;
+                }
+                writeln!(writer, "{}", record.file.display())?;
             }
             OutputFormat::Json => {
                 if self.first.swap(false, Ordering::SeqCst) {
@@ -59,7 +70,7 @@ impl StreamWriter {
                 } else {
                     writeln!(writer, ",")?;
                 }
-                let json = serde_json::to_string_pretty(patient)?;
+                let json = serde_json::to_string_pretty(record)?;
                 write!(writer, "{}", json)?;
             }
         }
@@ -95,32 +106,46 @@ mod test {
         }
     }
 
-    fn sample_patients() -> Vec<Patient> {
+    fn field_names() -> Vec<String> {
+        vec!["PatientID".to_string(), "PatientName".to_string()]
+    }
+
+    fn sample_records() -> Vec<Record> {
         vec![
-            Patient {
-                patient_id: "1".to_string(),
-                patient_name: "Philip Dick".to_string(),
+            Record {
                 file: PathBuf::from("file1.dcm"),
+                fields: vec![
+                    ("PatientID".to_string(), "1".to_string()),
+                    ("PatientName".to_string(), "Philip Dick".to_string()),
+                ],
             },
-            Patient {
-                patient_id: "2".to_string(),
-                patient_name: "Kurt Vonnegut".to_string(),
+            Record {
                 file: PathBuf::from("file2.dcm"),
+                fields: vec![
+                    ("PatientID".to_string(), "2".to_string()),
+                    ("PatientName".to_string(), "Kurt Vonnegut".to_string()),
+                ],
             },
-            Patient {
-                patient_id: "3".to_string(),
-                patient_name: "James Ballard".to_string(),
+            Record {
                 file: PathBuf::from("file3.dcm"),
+                fields: vec![
+                    ("PatientID".to_string(), "3".to_string()),
+                    ("PatientName".to_string(), "James Ballard".to_string()),
+                ],
             },
         ]
     }
 
     fn run(format: OutputFormat) -> String {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer =
-            StreamWriter::with_writer(format, Box::new(SharedBuffer(buffer.clone()))).unwrap();
-        for patient in sample_patients() {
-            writer.write_patient(&patient).unwrap();
+        let writer = StreamWriter::with_writer(
+            format,
+            Box::new(SharedBuffer(buffer.clone())),
+            &field_names(),
+        )
+        .unwrap();
+        for record in sample_records() {
+            writer.write_record(&record).unwrap();
         }
         writer.finish().unwrap();
 
@@ -130,17 +155,19 @@ mod test {
 
     #[test]
     fn test_stream_as_csv() {
-        let expected = "Patient ID,Patient Name,File\n1,Philip Dick,file1.dcm\n2,Kurt Vonnegut,file2.dcm\n3,James Ballard,file3.dcm\n";
+        let expected = "PatientID,PatientName,File\n1,Philip Dick,file1.dcm\n2,Kurt Vonnegut,file2.dcm\n3,James Ballard,file3.dcm\n";
         assert_eq!(run(OutputFormat::Csv), expected);
     }
 
     #[test]
     fn test_stream_as_json() {
         let result = run(OutputFormat::Json);
-        let parsed: Vec<Patient> = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].patient_id, "1");
-        assert_eq!(parsed[0].patient_name, "Philip Dick");
-        assert_eq!(parsed[2].patient_id, "3");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let records = parsed.as_array().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["PatientID"], "1");
+        assert_eq!(records[0]["PatientName"], "Philip Dick");
+        assert_eq!(records[2]["PatientID"], "3");
+        assert_eq!(records[0]["file"], "file1.dcm");
     }
 }
