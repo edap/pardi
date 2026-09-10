@@ -31,4 +31,16 @@ Example: `./target/release/pardi --path data --debug`
 
 Example: `./target/release/pardi --path data --format json --output catalog.json`
 
+## Benchmarks
+
+The project has a [Criterion](https://docs.rs/criterion) benchmark suite in `benches/catalog_benchmark.rs` covering DICOM file parsing.
+
+Run it with:
+
+```
+cargo bench
+```
+
+HTML reports (with plots) are written to `target/criterion/report/index.html`.
+
 

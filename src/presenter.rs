@@ -27,7 +27,9 @@ impl StreamWriter {
         Self::with_writer(format, writer)
     }
 
-    fn with_writer(format: OutputFormat, mut writer: Box<dyn Write + Send>) -> Result<Self> {
+    /// Builds a writer over an arbitrary sink (used for benchmarks/tests
+    /// that don't want to write to stdout or a real file).
+    pub fn with_writer(format: OutputFormat, mut writer: Box<dyn Write + Send>) -> Result<Self> {
         match format {
             OutputFormat::Json => write!(writer, "[")?,
             OutputFormat::Csv => writeln!(writer, "Patient ID,Patient Name,File")?,

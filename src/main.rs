@@ -1,26 +1,13 @@
-mod parser;
-mod presenter;
-mod printer;
-
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use parser::parse;
-use parser::Patient;
-use presenter::StreamWriter;
-use printer::print_error_messages;
+use pardi::parser::{parse, Patient};
+use pardi::presenter::StreamWriter;
+use pardi::printer::print_error_messages;
+use pardi::OutputFormat;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
-use serde::Serialize;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
-
-#[derive(clap::ValueEnum, Clone, Copy, Default, Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputFormat {
-    #[default]
-    Json,
-    Csv,
-}
 
 /// Simple program to catalogue DICOM files
 #[derive(Parser, Debug)]
