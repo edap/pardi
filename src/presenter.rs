@@ -7,22 +7,36 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// The per-format writer state. Kept behind a single [`Mutex`] (inside
+/// [`StreamWriter`]) so that whatever a format needs to track between
+/// records — the CSV writer's internal buffer, or whether the next JSON
+/// entry needs a leading comma — is protected by the same lock that
+/// serializes writes, instead of a second synchronization primitive.
+enum Sink {
+    Csv(Box<csv::Writer<Box<dyn Write + Send>>>),
+    Json {
+        writer: Box<dyn Write + Send>,
+        first: bool,
+    },
+}
 
 /// Writes records to the output one at a time. Safe to call
 /// [`write_record`](StreamWriter::write_record) from multiple threads
 /// concurrently (e.g. from a rayon parallel iterator).
 pub struct StreamWriter {
-    format: OutputFormat,
-    writer: Mutex<Box<dyn Write + Send>>,
-    first: AtomicBool,
+    sink: Mutex<Sink>,
 }
 
 impl StreamWriter {
     /// Opens `output` (or stdout, if `None`) and writes the format-specific
     /// preamble (a CSV header built from `field_names`, or a JSON `[`).
-    pub fn new(format: OutputFormat, output: Option<&Path>, field_names: &[String]) -> Result<Self> {
+    pub fn new(
+        format: OutputFormat,
+        output: Option<&Path>,
+        field_names: &[String],
+    ) -> Result<Self> {
         let writer: Box<dyn Write + Send> = match output {
             Some(path) => Box::new(
                 File::create(path)
@@ -37,17 +51,32 @@ impl StreamWriter {
     /// that don't want to write to stdout or a real file).
     pub fn with_writer(
         format: OutputFormat,
-        mut writer: Box<dyn Write + Send>,
+        writer: Box<dyn Write + Send>,
         field_names: &[String],
     ) -> Result<Self> {
-        match format {
-            OutputFormat::Json => write!(writer, "[")?,
-            OutputFormat::Csv => writeln!(writer, "{},File", field_names.join(","))?,
-        }
+        let sink = match format {
+            OutputFormat::Csv => {
+                let mut csv_writer = csv::WriterBuilder::new()
+                    // Deterministic across platforms, and to keep it a
+                    // simple diff from the previous plain-text output.
+                    .terminator(csv::Terminator::Any(b'\n'))
+                    .from_writer(writer);
+                let mut header: Vec<&str> = field_names.iter().map(String::as_str).collect();
+                header.push("File");
+                csv_writer.write_record(header)?;
+                Sink::Csv(Box::new(csv_writer))
+            }
+            OutputFormat::Json => {
+                let mut writer = writer;
+                write!(writer, "[")?;
+                Sink::Json {
+                    writer,
+                    first: true,
+                }
+            }
+        };
         Ok(Self {
-            format,
-            writer: Mutex::new(writer),
-            first: AtomicBool::new(true),
+            sink: Mutex::new(sink),
         })
     }
 
@@ -56,17 +85,22 @@ impl StreamWriter {
     /// [`with_writer`](StreamWriter::with_writer) — every record must have
     /// been parsed with that same field list.
     pub fn write_record(&self, record: &Record) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        match self.format {
-            OutputFormat::Csv => {
-                for (_, value) in &record.fields {
-                    write!(writer, "{},", value)?;
-                }
-                writeln!(writer, "{}", record.file.display())?;
+        // A panic while a worker holds this lock (e.g. from a downstream
+        // I/O error turned into a panic elsewhere) shouldn't take every
+        // other thread's writes down with it: the writer itself isn't left
+        // in a broken state by that, so recovering the guard is safe.
+        let mut sink = self.sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &mut *sink {
+            Sink::Csv(writer) => {
+                let file = record.file.display().to_string();
+                let mut row: Vec<&str> = record.fields.iter().map(|(_, v)| v.as_str()).collect();
+                row.push(&file);
+                writer.write_record(row)?;
             }
-            OutputFormat::Json => {
-                if self.first.swap(false, Ordering::SeqCst) {
+            Sink::Json { writer, first } => {
+                if *first {
                     writeln!(writer)?;
+                    *first = false;
                 } else {
                     writeln!(writer, ",")?;
                 }
@@ -78,11 +112,17 @@ impl StreamWriter {
     }
 
     pub fn finish(self) -> Result<()> {
-        let mut writer = self.writer.into_inner().unwrap();
-        if let OutputFormat::Json = self.format {
-            writeln!(writer, "\n]")?;
+        let sink = self
+            .sink
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match sink {
+            Sink::Csv(mut writer) => writer.flush()?,
+            Sink::Json { mut writer, .. } => {
+                writeln!(writer, "\n]")?;
+                writer.flush()?;
+            }
         }
-        writer.flush()?;
         Ok(())
     }
 }
@@ -129,8 +169,10 @@ mod test {
             Record {
                 file: PathBuf::from("file3.dcm"),
                 fields: vec![
+                    // Contains a comma and a double quote: exercises CSV
+                    // escaping (RFC 4180: wrap in quotes, double the quote).
                     ("PatientID".to_string(), "3".to_string()),
-                    ("PatientName".to_string(), "James Ballard".to_string()),
+                    ("PatientName".to_string(), "Ballard, \"Jim\"".to_string()),
                 ],
             },
         ]
@@ -155,7 +197,7 @@ mod test {
 
     #[test]
     fn test_stream_as_csv() {
-        let expected = "PatientID,PatientName,File\n1,Philip Dick,file1.dcm\n2,Kurt Vonnegut,file2.dcm\n3,James Ballard,file3.dcm\n";
+        let expected = "PatientID,PatientName,File\n1,Philip Dick,file1.dcm\n2,Kurt Vonnegut,file2.dcm\n3,\"Ballard, \"\"Jim\"\"\",file3.dcm\n";
         assert_eq!(run(OutputFormat::Csv), expected);
     }
 
@@ -167,7 +209,7 @@ mod test {
         assert_eq!(records.len(), 3);
         assert_eq!(records[0]["PatientID"], "1");
         assert_eq!(records[0]["PatientName"], "Philip Dick");
-        assert_eq!(records[2]["PatientID"], "3");
+        assert_eq!(records[2]["PatientName"], "Ballard, \"Jim\"");
         assert_eq!(records[0]["file"], "file1.dcm");
     }
 }
